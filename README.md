@@ -1,183 +1,146 @@
-# Uniswap v4 Hook Template
+# InternalSwap Hook (Uniswap v4)
 
-**A template for writing Uniswap v4 Hooks 🦄**
+A Uniswap v4 hook that takes a small extra fee on every swap, holds it inside the hook, and donates it to the pool's liquidity providers once enough has been collected.
 
-### Get Started
+Built as UHI homework. It is a simplified take on an "internal swap pool" style hook: it keeps the fee-capture and fee-distribution parts and leaves out the order-filling logic.
 
-This template provides a starting point for writing Uniswap v4 Hooks, including a simple example and preconfigured test environment. Start by creating a new repository using the "Use this template" button at the top right of this page. Alternatively you can also click this link:
+## Idea
 
-[![Use this Template](https://img.shields.io/badge/Use%20this%20Template-101010?style=for-the-badge&logo=github)](https://github.com/uniswapfoundation/v4-template/generate)
+Swappers pay a small hook fee (0.5%) on top of the pool's normal LP fee. Instead of sending it somewhere else, the hook keeps it and later hands it to the pool's LPs through Uniswap's `donate`. LPs earn extra yield without having to claim anything.
 
-1. The example hook [Counter.sol](src/Counter.sol) demonstrates the `beforeSwap()` and `afterSwap()` hooks
-2. The test template [Counter.t.sol](test/Counter.t.sol) preconfigures the v4 pool manager, test tokens, and test liquidity.
+## How it works
 
-<details>
-<summary>Updating to v4-template:latest</summary>
+Contract: `src/InternalSwap.sol`
 
-This template is actively maintained -- you can update the v4 dependencies, scripts, and helpers:
+| Callback | What it does |
+|---|---|
+| `afterSwap` | Takes `HOOK_FEE_BPS` (0.5%) from the **unspecified currency** of the swap, records it in `_poolFees[poolId]`, and pulls the tokens into the hook with `afterSwapReturnDelta`. Emits `FeesCollected`. |
+| `beforeSwap` | Donates collected fees to LPs if the threshold is reached. |
+| `beforeAddLiquidity` | Donates first, so new LPs do not share fees they did not earn. |
+| `beforeRemoveLiquidity` | Donates first, so leaving LPs get their share. |
+
+### Specified vs. unspecified currency
+
+In a swap the user fixes one token amount (**specified**) and the pool calculates the other (**unspecified**).
+
+- Exact input (`amountSpecified < 0`): the unspecified currency is the output.
+- Exact output (`amountSpecified > 0`): the unspecified currency is the input.
+
+```solidity
+bool unspecifiedIsCurrency1 = (params.amountSpecified < 0) == params.zeroForOne;
+```
+
+In `afterSwap` a hook can only change the delta of the unspecified currency, so the fee is always taken from it. The fee is `abs(amount) * 50 / 10_000`. The absolute value matters: the amount is negative when the swapper pays that currency (exact output).
+
+Example (exact input, gross output of 1000 units):
+
+```
+fee      = 1000 * 50 / 10_000 = 5
+swapper  receives 1000 - 5 = 995
+hook     holds 5 until it is donated
+```
+
+### Fee distribution
+
+`_distributeFees` runs when either collected amount reaches `donateThreshold`:
+
+1. Return if both amounts are below the threshold.
+2. Return if the pool has zero liquidity (`donate` would revert).
+3. Clear the stored fees first (effects before interactions).
+4. Call `poolManager.donate(key, amount0, amount1, "")`.
+5. Settle what the hook owes the PoolManager, for both currencies.
+6. Emit `FeesDonated`.
+
+## Public interface
+
+| Item | Description |
+|---|---|
+| `HOOK_FEE_BPS` | Hook fee in basis points (`50` = 0.5%) |
+| `donateThreshold` | Minimum collected amount (raw token units) before a donation. Set in the constructor |
+| `pendingFees(PoolKey)` | Returns the fees waiting to be donated, as `(amount0, amount1)` |
+| `FeesCollected(poolId, currency, amount)` | Emitted after each swap that collects a fee |
+| `FeesDonated(poolId, amount0, amount1)` | Emitted when fees are donated to LPs |
+
+Constructor: `InternalSwap(IPoolManager _poolManager, uint256 _donateThreshold)`.
+
+The hook does not depend on tick spacing or fee tier. It works with any pool key; it only reads swap amounts and the pool's liquidity.
+
+## Hook permissions
+
+Enabled: `beforeAddLiquidity`, `beforeRemoveLiquidity`, `beforeSwap`, `afterSwap`, `afterSwapReturnDelta`. All others are disabled.
+
+The deployed hook address must encode these flags. The tests use `deployCodeTo`; for a real deployment, mine the address with `HookMiner`.
+
+## Setup
+
+- Solidity `0.8.26`, Foundry
+- Dependencies are git submodules (Uniswap v4-core, OpenZeppelin Uniswap Hooks, hookmate, forge-std)
 
 ```bash
-git remote add template https://github.com/uniswapfoundation/v4-template
-git fetch template
-git merge template/main <BRANCH> --allow-unrelated-histories
-```
-
-</details>
-
-### Requirements
-
-This template is designed to work with Foundry (stable). If you are using Foundry Nightly, you may encounter compatibility issues. You can update your Foundry installation to the latest stable version by running:
-
-```
+# install Foundry
+curl -L https://foundry.paradigm.xyz | bash
 foundryup
-```
 
-To set up the project, run the following commands in your terminal to install dependencies and run the tests:
+# clone WITH submodules
+git clone --recurse-submodules https://github.com/Emran468/internalswaphook.git
+cd internalswaphook
 
-```
-forge install
+# if you already cloned without submodules
+git submodule update --init --recursive
+
+forge build
 forge test
 ```
 
-### Local Development
+Windows users: use WSL or Git Bash to install Foundry.
 
-Other than writing unit tests (recommended!), you can only deploy & test hooks on [anvil](https://book.getfoundry.sh/anvil/) locally. Scripts are available in the `script/` directory, which can be used to deploy hooks, create pools, provide liquidity and swap tokens. The scripts support both local `anvil` environment as well as running them directly on a production network.
+## Tests
 
-### Executing locally with using **Anvil**:
+`test/InternalSwap.t.sol` has 11 tests. The repo also contains the template's 6 `EasyPosm` tests, so `forge test` runs 17 in total.
 
-1. Start Anvil (or fork a specific chain using anvil):
-
-```bash
-anvil
-```
-
-or
-
-```bash
-anvil --fork-url <YOUR_RPC_URL>
-```
-
-2. Execute scripts:
+- Permissions and constants are as expected
+- Hook callbacks revert when not called by the PoolManager
+- No fees pending before any swap
+- Exact input, currency0 -> currency1: fee collected in currency1
+- Exact input, currency1 -> currency0: fee collected in currency0
+- Exact output, currency0 -> currency1: swapper pays the fee on top, in currency0
+- Fees accumulate while below the threshold
+- Fuzz: the fee is always 0.5% of the gross amount
+- Fees are donated before the next swap once the threshold is reached
+- Fees are donated before adding liquidity and pending fees reset to zero
 
 ```bash
-forge script script/00_DeployHook.s.sol \
-    --rpc-url http://localhost:8545 \
-    --private-key <PRIVATE_KEY> \
-    --broadcast
+forge test --match-contract InternalSwapTest -vvv
+forge coverage --match-path src/InternalSwap.sol
 ```
 
-### Using **RPC URLs** (actual transactions):
+## Differences from a full internal swap pool
 
-:::info
-It is best to not store your private key even in .env or enter it directly in the command line. Instead use the `--account` flag to select your private key from your keystore.
-:::
+| | Full version | This version |
+|---|---|---|
+| Fee capture | `afterSwap` | `afterSwap` |
+| Fill swaps from held fees in `beforeSwap` | Yes | **No** |
+| Donated currencies | currency0 only | **Both** |
+| Negative unspecified amount | Not handled | Uses the absolute value |
+| Zero-liquidity check before donate | No | Yes |
+| Threshold | Constant | Constructor argument |
 
-### Follow these steps if you have not stored your private key in the keystore:
+## Limitations
 
-<details>
+- **Raw-unit threshold:** `donateThreshold` is in raw token units, so the same number means different things for tokens with different decimals (for example USDC vs WETH).
+- **Extra cost for swappers:** the 0.5% hook fee is charged on top of the pool's own LP fee.
+- **Funds held in the hook:** collected fees sit in the hook until donated, so a bug in the hook could lock them.
+- **Donation timing:** fees are only donated when a swap or liquidity change happens after the threshold is reached.
+- **Not covered by tests yet:** `beforeRemoveLiquidity` distribution and the zero-liquidity skip.
+- **Not audited:** for learning only.
 
-1. Add your private key to the keystore:
+## Possible improvements
 
-```bash
-cast wallet import <SET_A_NAME_FOR_KEY> --interactive
-```
+- Make the fee configurable per pool
+- Use a per-currency threshold to handle different decimals
+- Add a keeper function so anyone can trigger a donation
+- Add tests for remove-liquidity and zero-liquidity cases
 
-2. You will prompted to enter your private key and set a password, fill and press enter:
+## License
 
-```
-Enter private key: <YOUR_PRIVATE_KEY>
-Enter keystore password: <SET_NEW_PASSWORD>
-```
-
-You should see this:
-
-```
-`<YOUR_WALLET_PRIVATE_KEY_NAME>` keystore was saved successfully. Address: <YOUR_WALLET_ADDRESS>
-```
-
-::: warning
-Use `history -c` to clear your command history.
-:::
-
-</details>
-
-1. Execute scripts:
-
-```bash
-forge script script/00_DeployHook.s.sol \
-    --rpc-url <YOUR_RPC_URL> \
-    --account <YOUR_WALLET_PRIVATE_KEY_NAME> \
-    --sender <YOUR_WALLET_ADDRESS> \
-    --broadcast
-```
-
-You will prompted to enter your wallet password, fill and press enter:
-
-```
-Enter keystore password: <YOUR_PASSWORD>
-```
-
-### Key Modifications to note:
-
-1. Update the `token0` and `token1` addresses in the `BaseScript.sol` file to match the tokens you want to use in the network of your choice for sepolia and mainnet deployments.
-2. Update the `token0Amount` and `token1Amount` in the `CreatePoolAndAddLiquidity.s.sol` file to match the amount of tokens you want to provide liquidity with.
-3. Update the `token0Amount` and `token1Amount` in the `AddLiquidity.s.sol` file to match the amount of tokens you want to provide liquidity with.
-4. Update the `amountIn` and `amountOutMin` in the `Swap.s.sol` file to match the amount of tokens you want to swap.
-
-### Verifying the hook contract
-
-```bash
-forge verify-contract \
-  --rpc-url <URL> \
-  --chain <CHAIN_NAME_OR_ID> \
-  # Generally etherscan
-  --verifier <Verification_Provider> \
-  # Use --etherscan-api-key <ETHERSCAN_API_KEY> if you are using etherscan
-  --verifier-api-key <Verification_Provider_API_KEY> \
-  --constructor-args <ABI_ENCODED_ARGS> \
-  --num-of-optimizations <OPTIMIZER_RUNS> \
-  <Contract_Address> \
-  <path/to/Contract.sol:ContractName>
-  --watch
-```
-
-### Troubleshooting
-
-<details>
-
-#### Permission Denied
-
-When installing dependencies with `forge install`, Github may throw a `Permission Denied` error
-
-Typically caused by missing Github SSH keys, and can be resolved by following the steps [here](https://docs.github.com/en/github/authenticating-to-github/connecting-to-github-with-ssh)
-
-Or [adding the keys to your ssh-agent](https://docs.github.com/en/authentication/connecting-to-github-with-ssh/generating-a-new-ssh-key-and-adding-it-to-the-ssh-agent#adding-your-ssh-key-to-the-ssh-agent), if you have already uploaded SSH keys
-
-#### Anvil fork test failures
-
-Some versions of Foundry may limit contract code size to ~25kb, which could prevent local tests to fail. You can resolve this by setting the `code-size-limit` flag
-
-```
-anvil --code-size-limit 40000
-```
-
-#### Hook deployment failures
-
-Hook deployment failures are caused by incorrect flags or incorrect salt mining
-
-1. Verify the flags are in agreement:
-   - `getHookCalls()` returns the correct flags
-   - `flags` provided to `HookMiner.find(...)`
-2. Verify salt mining is correct:
-   - In **forge test**: the _deployer_ for: `new Hook{salt: salt}(...)` and `HookMiner.find(deployer, ...)` are the same. This will be `address(this)`. If using `vm.prank`, the deployer will be the pranking address
-   - In **forge script**: the deployer must be the CREATE2 Proxy: `0x4e59b44847b379578588920cA78FbF26c0B4956C`
-     - If anvil does not have the CREATE2 deployer, your foundry may be out of date. You can update it with `foundryup`
-
-</details>
-
-### Additional Resources
-
-- [Uniswap v4 docs](https://docs.uniswap.org/contracts/v4/overview)
-- [v4-periphery](https://github.com/uniswap/v4-periphery)
-- [v4-core](https://github.com/uniswap/v4-core)
-- [v4-by-example](https://v4-by-example.org)
+MIT
